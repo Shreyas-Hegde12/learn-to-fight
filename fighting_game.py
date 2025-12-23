@@ -29,6 +29,12 @@ JUMP_FORCE = -26        # Snappy jump
 ATTACK_COOLDOWN = 30    # Duration of attack animation
 SHOOT_DAMAGE = 25
 
+# --- PERSISTENCE HELPER ---
+def enable_ai_shooting():
+    if not os.path.exists("ai_memory.txt"):
+        with open("ai_memory.txt", "w") as f:
+            f.write("1")
+
 # --- HELPER FUNCTIONS ---
 def draw_text(text, size, color, x, y, align="center"):
     font = pygame.font.SysFont("arial", size, bold=True)
@@ -554,7 +560,114 @@ class VillainBrain:
 
         self.state_buffer = final_action
         return final_action
-     
+    
+class LearningVillainBrain:
+    ACTIONS = ["LEFT", "RIGHT", "JUMP", "PUNCH", "KICK", "SHIELD", "SHOOT", "IDLE"]
+
+    def __init__(self, difficulty, lr=0.12, gamma=0.9, eps_start=0.35):
+        self.rule = VillainBrain(difficulty)         # keep original rule-based brain
+        self.lr = lr
+        self.gamma = gamma
+        self.epsilon = eps_start                     # exploration for learned policy
+        self.q = defaultdict(lambda: defaultdict(float))
+        self.steps = 0
+        self.last_state = None
+        self.last_action = None
+        # controls how quickly learned policy overtakes rule-based: grows with steps
+        self.learn_weight_schedule = lambda s: min(0.05 + s / 4000.0, 0.9)
+
+    def _bucket_distance(self, villain, player):
+        dist = abs(villain.rect.centerx - player.rect.centerx)
+        return int(dist // 50)   # coarse buckets (0..)
+
+    def _encode_state(self, villain, player):
+        return (
+            self._bucket_distance(villain, player),
+            1 if player.is_attacking else 0,
+            1 if (player.projectile and player.projectile.active) else 0,
+            1 if (villain.shield_gauge > 20) else 0,
+            int(villain.rect.left < 120 or villain.rect.right > (WIDTH - 120))  # cornered flag
+        )
+
+    def _argmax_q(self, state):
+        best = None
+        best_v = -1e9
+        for a in self.ACTIONS:
+            v = self.q[state][a]
+            if v > best_v:
+                best_v = v
+                best = a
+        # fallback
+        return best if best is not None else "IDLE"
+
+    def _epsilon_greedy(self, state):
+        if random.random() < self.epsilon:
+            return random.choice(self.ACTIONS)
+        return self._argmax_q(state)
+
+    def decide_action(self, villain, player):
+        state = self._encode_state(villain, player)
+        self.steps += 1
+
+        # decide how much to prefer learned policy over rule-based
+        learn_weight = self.learn_weight_schedule(self.steps)
+
+        # pick action: either learned policy (with eps-greedy) or rule brain
+        use_learned = random.random() < learn_weight
+
+        if use_learned:
+            action = self._epsilon_greedy(state)
+        else:
+            # use rule brain's opinion
+            action = self.rule.decide_action(villain, player)
+
+            # occasionally explore near rule decision
+            if random.random() < 0.05:
+                action = random.choice(self.ACTIONS)
+
+        # store last transition context for credit assignment when damage occurs
+        self.last_state = state
+        self.last_action = action
+        return action
+
+    def on_damage(self, attacker_is_player, amount, player, villain):
+        """
+        Call this AFTER damage is applied.
+        attacker_is_player: True if player caused damage, False if villain caused damage.
+        amount: positive integer damage amount (same as you pass to take_damage)
+        """
+        # reward from the AI villain's perspective: positive if villain did damage to player
+        if attacker_is_player:
+            reward = -amount
+        else:
+            reward = amount
+
+        # compute next state (current situation after damage)
+        if self.last_state is None or self.last_action is None:
+            return  # nothing to update
+
+        next_state = self._encode_state(villain, player)
+
+        s = self.last_state
+        a = self.last_action
+
+        max_next = max(self.q[next_state].values()) if self.q[next_state] else 0.0
+        td = reward + self.gamma * max_next - self.q[s][a]
+        self.q[s][a] += self.lr * td
+
+        # slight decay of epsilon over time so learning becomes exploitative
+        self.epsilon = max(0.02, self.epsilon * 0.9995)
+
+        # clear last action to avoid double-crediting for same event
+        self.last_state = None
+        self.last_action = None
+
+    # optional: allow external forcing of learning updates (experience replay placeholder)
+    def manual_update(self, state, action, reward, next_state):
+        max_next = max(self.q[next_state].values()) if self.q[next_state] else 0.0
+        td = reward + self.gamma * max_next - self.q[state][action]
+        self.q[state][action] += self.lr * td
+
 # --- MAIN GAME LOOP ---
 def main():
     running = True
